@@ -17,7 +17,7 @@ vim.pack.add({ "https://github.com/folke/snacks.nvim", "/Users/benomahony/Code/o
 vim.keymap.set("n", "<leader>sv", "<cmd>CodeChat<cr>", { desc = "Search code by [V]oice" })
 ```
 
-`:CodeChat` opens the picker and starts listening. Listening stops after a 2.5 s pause, or after 8 s if you don't say anything. Then it's an ordinary Snacks picker: `<CR>` opens the match, `<C-q>` sends every match to the quickfix list, `<C-v>` / `<C-s>` open in a split, and typing filters the matches. `<A-v>` speaks again.
+`:CodeChat` opens the picker and starts listening. Listening stops after a 2.5 s pause, or after 8 s if you don't say anything. Then it's an ordinary Snacks picker: `<CR>` opens the match, `<C-q>` sends every match to the quickfix list, `<C-v>` / `<C-s>` open in a split, and typing filters the matches. `<C-Space>` speaks again.
 
 `vim.pack` installs a local path by cloning it, so changes here reach Neovim once they're committed and you run `vim.pack.update()`. The first search sets up the Python environment, loads the model and embeds the repository; later runs only embed what changed. To load the model when Neovim starts instead:
 

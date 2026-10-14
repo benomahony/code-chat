@@ -90,9 +90,9 @@ local function title()
   if not server.ready then
     text = server.status
   elseif state.listening then
-    text = #state.hits > 0 and ("Listening… %.1f s"):format(state.seconds) or "Listening… describe the code"
+    text = state.seconds > 0 and ("Listening… %.1f s"):format(state.seconds) or "Listening… describe the code"
   elseif state.final then
-    text = "Closest to what you said  (<a-v> speak again)"
+    text = "Closest to what you said  (<C-Space> speak again)"
   else
     text = server.status
   end
@@ -124,7 +124,7 @@ local function items()
 end
 
 local function listen()
-  state.final, heights = false, {}
+  state.final, state.seconds, heights = false, 0, {}
   send({ type = "listen" })
 end
 
@@ -149,8 +149,8 @@ function M.pick()
     matcher = { sort_empty = false },
     actions = { code_chat_listen = listen },
     win = {
-      input = { keys = { ["<a-v>"] = { "code_chat_listen", mode = { "i", "n" }, desc = "Speak again" } } },
-      list = { keys = { ["<a-v>"] = { "code_chat_listen", desc = "Speak again" } } },
+      input = { keys = { ["<c-space>"] = { "code_chat_listen", mode = { "i", "n" }, desc = "Speak again" } } },
+      list = { keys = { ["<c-space>"] = { "code_chat_listen", desc = "Speak again" } } },
     },
     on_close = function()
       timer:stop()
