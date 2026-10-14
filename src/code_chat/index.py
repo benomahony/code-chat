@@ -12,10 +12,13 @@ from pathlib import Path
 
 import numpy as np
 
-from code_chat.chunks import Chunk, files, split
+from code_chat.chunks import Chunk, files, split, wanted
 
 MODEL = "google/embeddinggemma-2"
+DIMS = 768
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "code-chat"
+LIMIT = 30
+SMOOTHING = 0.4  # Weight of the newest update.
 
 # --- Model -------------------------------------------------------------------
 
@@ -38,89 +41,134 @@ def model():
             config_kwargs={"vision_config": None},
             model_kwargs={"torch_dtype": dtype},
         )
+    dims = _model.get_sentence_embedding_dimension()
+    assert dims == DIMS, f"{MODEL} gives {dims}-dimensional vectors; the cache expects {DIMS}"
+    assert _model.max_seq_length > 0, f"{MODEL} loaded with no input length ({_model.max_seq_length})"
     return _model
 
 
 def unit(vectors: np.ndarray) -> np.ndarray:
-    return vectors / np.linalg.norm(vectors, axis=-1, keepdims=True)
+    norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+    assert np.all(norms > 0), f"{int(np.sum(norms == 0))} zero vectors can't be normalised"
+    out = vectors / norms
+    assert out.shape == vectors.shape, f"normalising changed the shape from {vectors.shape} to {out.shape}"
+    return out
 
 
 def embed(inputs: list) -> np.ndarray:
-    return unit(model().encode(inputs, batch_size=8, convert_to_numpy=True).astype(np.float32))
+    assert inputs, "embed() needs at least one input"
+    vectors = unit(model().encode(inputs, batch_size=8, convert_to_numpy=True).astype(np.float32))
+    assert vectors.shape == (len(inputs), DIMS), f"embedded {len(inputs)} inputs into shape {vectors.shape}"
+    return vectors
 
 
 def embed_audio(audio: np.ndarray) -> np.ndarray:
+    assert audio.ndim == 1, f"audio must be mono samples, got shape {audio.shape}"
+    assert len(audio) > 0, f"there's no audio to embed (got {len(audio)} samples); wait for Session.due()"
     return embed([{"audio": audio}])[0]
+
+
+def key(chunk: Chunk) -> str:
+    """Cache key: vectors are cached by the content they embed."""
+    document = chunk.document()
+    assert document, f"chunk of {chunk.file} has an empty document"
+    out = hashlib.sha256((MODEL + document).encode()).hexdigest()[:32]
+    assert len(out) == 32, f"cache key {out!r} should be 32 hex digits"
+    return out
+
+
+def first_line(text: str) -> str:
+    assert text.strip(), "a chunk with no text has no first line to preview"
+    out = next(line.strip() for line in text.splitlines() if line.strip())[:120]
+    assert out and len(out) <= 120, f"preview {out!r} must be non-empty and at most 120 characters"
+    return out
 
 
 # --- Index -------------------------------------------------------------------
 
-LIMIT = 30
-
 
 class Index:
     def __init__(self, root: Path):
+        assert root.is_absolute(), f"repository root {root} must be absolute"
+        assert root.is_dir(), f"repository root {root} isn't a directory"
         self.root = root
         self.cache_file = CACHE / f"{hashlib.sha256(str(root).encode()).hexdigest()[:16]}.npz"
         self.cache: dict[str, np.ndarray] = {}
         self.chunks: list[Chunk] = []
-        self.vectors = np.zeros((0, 0), dtype=np.float32)
+        self.vectors = np.zeros((0, DIMS), dtype=np.float32)
 
-    # Vectors are cached by the content they embed, so a rebuild only embeds
-    # what changed.
     def _load_cache(self):
+        assert self.cache_file.suffix == ".npz", f"cache file {self.cache_file} must be .npz"
         if self.cache or not self.cache_file.exists():
             return
         data = np.load(self.cache_file)
-        self.cache = dict(zip(data["keys"].tolist(), data["vectors"].astype(np.float32)))
+        keys, vectors = data["keys"], data["vectors"]
+        assert len(keys) == len(vectors), f"{self.cache_file} has {len(keys)} keys for {len(vectors)} vectors; delete it to rebuild"
+        self.cache = dict(zip(keys.tolist(), vectors.astype(np.float32)))
 
     def _save_cache(self, keep: set[str]):
         self.cache = {k: v for k, v in self.cache.items() if k in keep}
+        shapes = {v.shape for v in self.cache.values()}
+        assert shapes <= {(DIMS,)}, f"cached vectors must all have {DIMS} dimensions, found shapes {shapes}"
         CACHE.mkdir(parents=True, exist_ok=True)
         keys = list(self.cache)
-        vectors = np.stack([self.cache[k] for k in keys]) if keys else np.zeros((0, 768))
+        vectors = np.stack([self.cache[k] for k in keys]) if keys else np.zeros((0, DIMS))
         np.savez(self.cache_file, keys=np.array(keys), vectors=vectors.astype(np.float16))
+        assert self.cache_file.exists(), f"saving the cache didn't write {self.cache_file}"
 
     def _vectors(self, chunks: list[Chunk], progress=None) -> np.ndarray:
+        """Vectors for `chunks`, embedding only those not already cached."""
         self._load_cache()
-        keys = [hashlib.sha256((MODEL + c.document()).encode()).hexdigest()[:32] for c in chunks]
+        keys = [key(c) for c in chunks]
         missing = [(k, c) for k, c in zip(keys, chunks) if k not in self.cache]
+        total = len(missing)
         batch = 32
-        for start in range(0, len(missing), batch):
+        for start in range(0, total, batch):
             part = missing[start : start + batch]
             for (k, _), v in zip(part, embed([c.document() for _, c in part])):
                 self.cache[k] = v
             if progress:
-                progress(min(start + batch, len(missing)), len(missing))
+                progress(min(start + batch, total), total)
         if missing:
             self._save_cache(set(keys) | set(self.cache))
-        return np.stack([self.cache[k] for k in keys]) if keys else np.zeros((0, 768), dtype=np.float32)
+        uncached = [k for k in keys if k not in self.cache]
+        assert not uncached, f"{len(uncached)} chunks still have no vector after embedding"
+        out = np.stack([self.cache[k] for k in keys]) if keys else np.zeros((0, DIMS), dtype=np.float32)
+        assert len(out) == len(chunks), f"{len(out)} vectors for {len(chunks)} chunks"
+        return out
 
     def build(self, progress=None):
         chunks = [c for name in files(self.root) for c in split(self.root, name)]
         self._set(chunks, self._vectors(chunks, progress))
         # Drop vectors for code that no longer exists.
-        keys = {hashlib.sha256((MODEL + c.document()).encode()).hexdigest()[:32] for c in chunks}
-        self._save_cache(keys)
+        self._save_cache({key(c) for c in chunks})
+        assert len(self.chunks) == len(chunks), f"indexed {len(self.chunks)} of {len(chunks)} chunks"
+        assert len(self.cache) <= len(chunks), f"cache holds {len(self.cache)} vectors for {len(chunks)} chunks"
 
     def update(self, name: str):
         """Re-split and re-embed one file, after it's saved."""
+        assert not name.startswith("/"), f"{name} must be relative to {self.root}"
         kept = [(c, v) for c, v in zip(self.chunks, self.vectors) if c.file != name]
-        fresh = split(self.root, name) if (self.root / name).exists() else []
+        # A deleted file, or one the index skips, leaves only what was kept.
+        fresh = split(self.root, name) if (self.root / name).exists() and wanted(self.root, name) else []
         vectors = self._vectors(fresh)
-        chunks = [c for c, _ in kept] + fresh
-        matrix = np.concatenate([np.stack([v for _, v in kept]) if kept else np.zeros((0, vectors.shape[1])), vectors])
-        self._set(chunks, matrix.astype(np.float32))
+        old = np.stack([v for _, v in kept]) if kept else np.zeros((0, DIMS), dtype=np.float32)
+        self._set([c for c, _ in kept] + fresh, np.concatenate([old, vectors]).astype(np.float32))
+        expected = len(kept) + len(fresh)
+        assert len(self.chunks) == expected, f"{name}: expected {expected} chunks, have {len(self.chunks)}"
 
     def _set(self, chunks: list[Chunk], vectors: np.ndarray):
+        assert len(chunks) == len(vectors), f"{len(chunks)} chunks but {len(vectors)} vectors; embed every chunk before indexing it"
+        assert vectors.ndim == 2 and vectors.shape[1] == DIMS, f"vectors must be (n, {DIMS}), got {vectors.shape}"
         self.chunks = chunks
         self.vectors = vectors
-
-    # --- Ranking ---------------------------------------------------------------
 
     def spoken(self, vector: np.ndarray, smoothed: np.ndarray | None = None) -> list[tuple[int, float]]:
         """Chunks by cosine to what was said, best first, averaged with
         earlier updates when `smoothed` is given."""
+        assert vector.shape == (DIMS,), f"query vector must have {DIMS} dimensions, got {vector.shape}"
+        count = len(self.chunks)
+        assert smoothed is None or len(smoothed) == count, f"smoothed scores for {len(smoothed)} chunks, index has {count}"
         cosine = self.vectors @ vector
         if smoothed is not None:
             fresh = np.isnan(smoothed)
@@ -130,22 +178,24 @@ class Index:
         return [(int(i), float(cosine[i])) for i in np.argsort(-cosine)[:LIMIT]]
 
     def hits(self, ranked: list[tuple[int, float]]) -> list[dict]:
-        return [
-            {
-                "file": str(self.root / self.chunks[i].file),
-                "path": self.chunks[i].file,
-                "start": self.chunks[i].start,
-                "end": self.chunks[i].end,
-                "symbols": self.chunks[i].symbols[:4],
-                "preview": first_line(self.chunks[i].text),
-                "score": round(score, 4),
-            }
-            for i, score in ranked[:LIMIT]
-        ]
+        """What editors show for each ranked chunk."""
+        outside = [i for i, _ in ranked if not 0 <= i < len(self.chunks)]
+        assert not outside, f"ranked chunks {outside[:3]} are out of range for {len(self.chunks)} chunks"
+        out = [self.hit(self.chunks[i], score) for i, score in ranked[:LIMIT]]
+        assert len(out) <= LIMIT, f"{len(out)} hits is more than the limit of {LIMIT}"
+        return out
 
-
-SMOOTHING = 0.4  # Weight of the newest update.
-
-
-def first_line(text: str) -> str:
-    return next((line.strip() for line in text.splitlines() if line.strip()), "")[:120]
+    def hit(self, chunk: Chunk, score: float) -> dict:
+        assert chunk.start <= chunk.end, f"chunk of {chunk.file} ends at {chunk.end}, before it starts at {chunk.start}"
+        assert -1.001 <= score <= 1.001, f"cosine score {score} must be between -1 and 1"
+        return {
+            "file": str(self.root / chunk.file),
+            "path": chunk.file,
+            "start": chunk.start,
+            "end": chunk.end,
+            # Byte column where the chunk ends on its last line.
+            "end_col": len(chunk.text.rstrip("\n").split("\n")[-1].encode()),
+            "symbols": chunk.symbols[:4],
+            "preview": first_line(chunk.text),
+            "score": round(score, 4),
+        }

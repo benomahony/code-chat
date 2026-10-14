@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "numpy",
+    "rich",
     "sentence-transformers>=6",
     "sounddevice",
     "torch",
@@ -16,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-code-chat = "code_chat.server:main"
+code-chat = "code_chat.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.8,<0.12"]
