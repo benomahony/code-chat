@@ -1,7 +1,7 @@
 [project]
 name = "code-chat"
 version = "0.1.0"
-description = "Search code by describing it, out loud, with EmbeddingGemma 2, from Neovim."
+description = "Search code by describing it out loud, with EmbeddingGemma 2, from Neovim, the terminal or any editor."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -22,3 +22,11 @@ code-chat = "code_chat.cli:main"
 [build-system]
 requires = ["uv_build>=0.8,<0.12"]
 build-backend = "uv_build"
+
+[tool.basedpyright]
+include = ["src/code_chat"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+
+[dependency-groups]
+dev = ["basedpyright"]

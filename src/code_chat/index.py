@@ -8,11 +8,21 @@ they're consistently better.
 
 import hashlib
 import os
+import threading
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import numpy as np
+import numpy.typing as npt
 
 from code_chat.chunks import Chunk, files, split, wanted
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
+
+Vectors = npt.NDArray[np.float32]
+Progress = Callable[[int, int], None]
 
 MODEL = "google/embeddinggemma-2"
 DIMS = 768
@@ -20,67 +30,88 @@ CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "code-c
 LIMIT = 30
 SMOOTHING = 0.4  # Weight of the newest update.
 
+
+class Hit(TypedDict):
+    """A ranked chunk, as editors receive it."""
+
+    file: str  # Absolute.
+    path: str  # Relative to the repository.
+    start: int  # 1-based, inclusive.
+    end: int
+    end_col: int  # Byte column where the chunk ends on its last line.
+    symbols: list[str]
+    preview: str
+    score: float
+
+
 # --- Model -------------------------------------------------------------------
 
-_model = None
+
+_model: "SentenceTransformer | None" = None
+_loading = threading.Lock()
 
 
-def model():
+def model() -> "SentenceTransformer":
+    """EmbeddingGemma 2, loaded once per process however many threads ask."""
     global _model
-    if _model is None:
-        import torch
-        from sentence_transformers import SentenceTransformer
+    with _loading:
+        if _model is None:
+            import torch
+            from sentence_transformers import SentenceTransformer
 
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
-        # bfloat16 on Apple GPUs; float16 overflows this model.
-        dtype = torch.bfloat16 if device == "mps" else torch.float32
-        _model = SentenceTransformer(
-            MODEL,
-            device=device,
-            # Code as text, queries as speech; leave out the image encoder.
-            config_kwargs={"vision_config": None},
-            model_kwargs={"torch_dtype": dtype},
-        )
-    dims = _model.get_sentence_embedding_dimension()
-    assert dims == DIMS, f"{MODEL} gives {dims}-dimensional vectors; the cache expects {DIMS}"
-    assert _model.max_seq_length > 0, f"{MODEL} loaded with no input length ({_model.max_seq_length})"
-    return _model
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            _model = SentenceTransformer(
+                MODEL,
+                device=device,
+                # Code as text, queries as speech; leave out the image encoder.
+                config_kwargs={"vision_config": None},
+                # bfloat16 on Apple GPUs; float16 overflows this model.
+                model_kwargs={"torch_dtype": "bfloat16" if device == "mps" else "float32"},
+            )
+        loaded = _model
+    dims = loaded.get_embedding_dimension()
+    assert dims == DIMS, f"{MODEL} gives {dims}-dimensional vectors but the cache stores {DIMS}; set DIMS to match"
+    assert (loaded.max_seq_length or 0) > 0, f"{MODEL} loaded with input length {loaded.max_seq_length}; delete it from the Hugging Face cache to download it again"
+    return loaded
 
 
-def unit(vectors: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
-    assert np.all(norms > 0), f"{int(np.sum(norms == 0))} zero vectors can't be normalised"
-    out = vectors / norms
-    assert out.shape == vectors.shape, f"normalising changed the shape from {vectors.shape} to {out.shape}"
+def unit(vectors: Vectors) -> Vectors:
+    norms: Vectors = np.sqrt(np.sum(vectors * vectors, axis=-1, keepdims=True))
+    assert np.all(norms > 0), f"{np.count_nonzero(norms == 0)} zero vectors can't be normalised; drop empty inputs before embedding"
+    out: Vectors = vectors / norms
+    assert out.shape == vectors.shape, f"normalising changed the shape from {vectors.shape} to {out.shape}; norms must keep their last axis"
     return out
 
 
-def embed(inputs: list) -> np.ndarray:
-    assert inputs, "embed() needs at least one input"
-    vectors = unit(model().encode(inputs, batch_size=8, convert_to_numpy=True).astype(np.float32))
-    assert vectors.shape == (len(inputs), DIMS), f"embedded {len(inputs)} inputs into shape {vectors.shape}"
+def embed(inputs: Sequence[str | dict[str, npt.NDArray[np.float32]]]) -> Vectors:
+    assert inputs, "embed() needs at least one input; skip the call when there's nothing to embed"
+    # encode()'s overloads include types sentence-transformers leaves unknown,
+    # so call it through a signature naming what code-chat gets back.
+    encode = cast(Callable[..., npt.NDArray[np.float32]], getattr(model(), "encode"))
+    vectors = unit(encode(list(inputs), batch_size=8, convert_to_numpy=True).astype(np.float32))
+    assert vectors.shape == (len(inputs), DIMS), f"embedded {len(inputs)} inputs into shape {vectors.shape}; check the model is {MODEL}"
     return vectors
 
 
-def embed_audio(audio: np.ndarray) -> np.ndarray:
-    assert audio.ndim == 1, f"audio must be mono samples, got shape {audio.shape}"
-    assert len(audio) > 0, f"there's no audio to embed (got {len(audio)} samples); wait for Session.due()"
+def embed_audio(audio: npt.NDArray[np.float32]) -> Vectors:
+    assert audio.ndim == 1, f"audio must be mono samples, got shape {audio.shape}; take one channel"
+    assert len(audio) > 0, f"there's no audio to embed (got {len(audio)} samples); wait for Session.take()"
     return embed([{"audio": audio}])[0]
 
 
 def key(chunk: Chunk) -> str:
     """Cache key: vectors are cached by the content they embed."""
     document = chunk.document()
-    assert document, f"chunk of {chunk.file} has an empty document"
+    assert document, f"chunk of {chunk.file} has an empty document; split() should drop blank chunks"
     out = hashlib.sha256((MODEL + document).encode()).hexdigest()[:32]
-    assert len(out) == 32, f"cache key {out!r} should be 32 hex digits"
+    assert len(out) == 32, f"cache key {out!r} should be 32 hex digits; keep the [:32] slice"
     return out
 
 
 def first_line(text: str) -> str:
-    assert text.strip(), "a chunk with no text has no first line to preview"
+    assert text.strip(), "a chunk with no text has no first line to preview; split() should drop blank chunks"
     out = next(line.strip() for line in text.splitlines() if line.strip())[:120]
-    assert out and len(out) <= 120, f"preview {out!r} must be non-empty and at most 120 characters"
+    assert 0 < len(out) <= 120, f"preview {out!r} must be 1 to 120 characters; keep the [:120] slice"
     return out
 
 
@@ -89,35 +120,45 @@ def first_line(text: str) -> str:
 
 class Index:
     def __init__(self, root: Path):
-        assert root.is_absolute(), f"repository root {root} must be absolute"
-        assert root.is_dir(), f"repository root {root} isn't a directory"
+        assert root.is_absolute(), f"repository root {root} must be absolute; resolve() it first"
+        assert root.is_dir(), f"repository root {root} isn't a directory; pass the repository to search"
         self.root = root
         self.cache_file = CACHE / f"{hashlib.sha256(str(root).encode()).hexdigest()[:16]}.npz"
-        self.cache: dict[str, np.ndarray] = {}
+        # Guards the cache and the index, which a build and an update could
+        # otherwise change at once.
+        self.lock = threading.Lock()
+        self.cache: dict[str, Vectors] = {}
         self.chunks: list[Chunk] = []
-        self.vectors = np.zeros((0, DIMS), dtype=np.float32)
+        self.vectors: Vectors = np.zeros((0, DIMS), dtype=np.float32)
 
     def _load_cache(self):
-        assert self.cache_file.suffix == ".npz", f"cache file {self.cache_file} must be .npz"
-        if self.cache or not self.cache_file.exists():
+        """Fill the in-memory cache from disk, once. Called with the lock held."""
+        assert self.lock.locked(), "_load_cache() changes the cache; call it with self.lock held"
+        if self.cache:
             return
-        data = np.load(self.cache_file)
+        try:
+            data = np.load(self.cache_file)
+        except FileNotFoundError:
+            return
         keys, vectors = data["keys"], data["vectors"]
         assert len(keys) == len(vectors), f"{self.cache_file} has {len(keys)} keys for {len(vectors)} vectors; delete it to rebuild"
         self.cache = dict(zip(keys.tolist(), vectors.astype(np.float32)))
 
     def _save_cache(self, keep: set[str]):
+        """Write the cache, keeping only `keep`. Called with the lock held."""
+        assert self.lock.locked(), "_save_cache() changes the cache; call it with self.lock held"
         self.cache = {k: v for k, v in self.cache.items() if k in keep}
         shapes = {v.shape for v in self.cache.values()}
-        assert shapes <= {(DIMS,)}, f"cached vectors must all have {DIMS} dimensions, found shapes {shapes}"
+        assert shapes <= {(DIMS,)}, f"cached vectors must all have {DIMS} dimensions, found {shapes}; delete {self.cache_file} to rebuild"
         CACHE.mkdir(parents=True, exist_ok=True)
         keys = list(self.cache)
         vectors = np.stack([self.cache[k] for k in keys]) if keys else np.zeros((0, DIMS))
         np.savez(self.cache_file, keys=np.array(keys), vectors=vectors.astype(np.float16))
-        assert self.cache_file.exists(), f"saving the cache didn't write {self.cache_file}"
 
-    def _vectors(self, chunks: list[Chunk], progress=None) -> np.ndarray:
-        """Vectors for `chunks`, embedding only those not already cached."""
+    def _vectors(self, chunks: list[Chunk], progress: Progress | None = None) -> Vectors:
+        """Vectors for `chunks`, embedding only those not already cached.
+        Called with the lock held."""
+        assert self.lock.locked(), "_vectors() changes the cache; call it with self.lock held"
         self._load_cache()
         keys = [key(c) for c in chunks]
         missing = [(k, c) for k, c in zip(keys, chunks) if k not in self.cache]
@@ -131,44 +172,47 @@ class Index:
                 progress(min(start + batch, total), total)
         if missing:
             self._save_cache(set(keys) | set(self.cache))
-        uncached = [k for k in keys if k not in self.cache]
-        assert not uncached, f"{len(uncached)} chunks still have no vector after embedding"
         out = np.stack([self.cache[k] for k in keys]) if keys else np.zeros((0, DIMS), dtype=np.float32)
-        assert len(out) == len(chunks), f"{len(out)} vectors for {len(chunks)} chunks"
+        assert len(out) == len(chunks), f"{len(out)} vectors for {len(chunks)} chunks; every missing chunk must be embedded above"
         return out
 
-    def build(self, progress=None):
+    def build(self, progress: Progress | None = None):
         chunks = [c for name in files(self.root) for c in split(self.root, name)]
-        self._set(chunks, self._vectors(chunks, progress))
-        # Drop vectors for code that no longer exists.
-        self._save_cache({key(c) for c in chunks})
-        assert len(self.chunks) == len(chunks), f"indexed {len(self.chunks)} of {len(chunks)} chunks"
-        assert len(self.cache) <= len(chunks), f"cache holds {len(self.cache)} vectors for {len(chunks)} chunks"
+        with self.lock:
+            self._set(chunks, self._vectors(chunks, progress))
+            # Drop vectors for code that no longer exists.
+            self._save_cache({key(c) for c in chunks})
+            cached = len(self.cache)
+        assert len(self.chunks) == len(chunks), f"indexed {len(self.chunks)} of {len(chunks)} chunks; _set() must take them all"
+        assert cached <= len(chunks), f"cache holds {cached} vectors for {len(chunks)} chunks; _save_cache() should drop the rest"
 
     def update(self, name: str):
         """Re-split and re-embed one file, after it's saved."""
-        assert not name.startswith("/"), f"{name} must be relative to {self.root}"
-        kept = [(c, v) for c, v in zip(self.chunks, self.vectors) if c.file != name]
-        # A deleted file, or one the index skips, leaves only what was kept.
-        fresh = split(self.root, name) if (self.root / name).exists() and wanted(self.root, name) else []
-        vectors = self._vectors(fresh)
-        old = np.stack([v for _, v in kept]) if kept else np.zeros((0, DIMS), dtype=np.float32)
-        self._set([c for c, _ in kept] + fresh, np.concatenate([old, vectors]).astype(np.float32))
+        assert not name.startswith("/"), f"{name} must be relative to {self.root}; pass the path from the repository root"
+        # wanted() is False for a deleted file, and split() returns nothing for
+        # one deleted after it, so either way only the kept chunks remain.
+        fresh = split(self.root, name) if wanted(self.root, name) else []
+        with self.lock:
+            kept = [(c, v) for c, v in zip(self.chunks, self.vectors) if c.file != name]
+            vectors = self._vectors(fresh)
+            old = np.stack([v for _, v in kept]) if kept else np.zeros((0, DIMS), dtype=np.float32)
+            self._set([c for c, _ in kept] + fresh, np.concatenate([old, vectors]).astype(np.float32))
+            count = len(self.chunks)
         expected = len(kept) + len(fresh)
-        assert len(self.chunks) == expected, f"{name}: expected {expected} chunks, have {len(self.chunks)}"
+        assert count == expected, f"{name}: expected {expected} chunks, have {count}; _set() must take kept and fresh chunks"
 
-    def _set(self, chunks: list[Chunk], vectors: np.ndarray):
+    def _set(self, chunks: list[Chunk], vectors: Vectors):
         assert len(chunks) == len(vectors), f"{len(chunks)} chunks but {len(vectors)} vectors; embed every chunk before indexing it"
-        assert vectors.ndim == 2 and vectors.shape[1] == DIMS, f"vectors must be (n, {DIMS}), got {vectors.shape}"
+        assert vectors.ndim == 2 and vectors.shape[1] == DIMS, f"vectors must be (n, {DIMS}), got {vectors.shape}; stack one vector per chunk"
         self.chunks = chunks
         self.vectors = vectors
 
-    def spoken(self, vector: np.ndarray, smoothed: np.ndarray | None = None) -> list[tuple[int, float]]:
+    def spoken(self, vector: Vectors, smoothed: Vectors | None = None) -> list[tuple[int, float]]:
         """Chunks by cosine to what was said, best first, averaged with
         earlier updates when `smoothed` is given."""
-        assert vector.shape == (DIMS,), f"query vector must have {DIMS} dimensions, got {vector.shape}"
+        assert vector.shape == (DIMS,), f"query vector must have {DIMS} dimensions, got {vector.shape}; embed it with embed_audio()"
         count = len(self.chunks)
-        assert smoothed is None or len(smoothed) == count, f"smoothed scores for {len(smoothed)} chunks, index has {count}"
+        assert smoothed is None or len(smoothed) == count, f"smoothed scores cover {len(smoothed)} chunks, index has {count}; start a new session after re-indexing"
         cosine = self.vectors @ vector
         if smoothed is not None:
             fresh = np.isnan(smoothed)
@@ -177,23 +221,22 @@ class Index:
             cosine = smoothed
         return [(int(i), float(cosine[i])) for i in np.argsort(-cosine)[:LIMIT]]
 
-    def hits(self, ranked: list[tuple[int, float]]) -> list[dict]:
+    def hits(self, ranked: list[tuple[int, float]]) -> list[Hit]:
         """What editors show for each ranked chunk."""
         outside = [i for i, _ in ranked if not 0 <= i < len(self.chunks)]
-        assert not outside, f"ranked chunks {outside[:3]} are out of range for {len(self.chunks)} chunks"
+        assert not outside, f"ranked chunks {outside[:3]} are out of range for {len(self.chunks)} chunks; rank against this index"
         out = [self.hit(self.chunks[i], score) for i, score in ranked[:LIMIT]]
-        assert len(out) <= LIMIT, f"{len(out)} hits is more than the limit of {LIMIT}"
+        assert len(out) <= LIMIT, f"{len(out)} hits is more than the limit of {LIMIT}; keep the [:LIMIT] slice"
         return out
 
-    def hit(self, chunk: Chunk, score: float) -> dict:
-        assert chunk.start <= chunk.end, f"chunk of {chunk.file} ends at {chunk.end}, before it starts at {chunk.start}"
-        assert -1.001 <= score <= 1.001, f"cosine score {score} must be between -1 and 1"
+    def hit(self, chunk: Chunk, score: float) -> Hit:
+        assert chunk.start <= chunk.end, f"chunk of {chunk.file} ends at {chunk.end}, before it starts at {chunk.start}; check split()"
+        assert -1.001 <= score <= 1.001, f"cosine score {score} must be between -1 and 1; normalise vectors with unit()"
         return {
             "file": str(self.root / chunk.file),
             "path": chunk.file,
             "start": chunk.start,
             "end": chunk.end,
-            # Byte column where the chunk ends on its last line.
             "end_col": len(chunk.text.rstrip("\n").split("\n")[-1].encode()),
             "symbols": chunk.symbols[:4],
             "preview": first_line(chunk.text),

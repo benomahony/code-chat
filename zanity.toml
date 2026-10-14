@@ -1,5 +1,8 @@
 #:schema https://raw.githubusercontent.com/benomahony/zanity/main/zanity.schema.json
 
+# Type stubs for third-party packages: declarations with no bodies to check.
+exclude = ["typings/"]
+
 [rules]
 select = ["all"]
 disable = []

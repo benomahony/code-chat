@@ -44,13 +44,15 @@ vim -q <(code-chat --list)     # ...into Vim's quickfix list
 code-chat ~/Code/some/repo     # search another repository
 ```
 
-It exits 1, printing nothing, when you cancel or nothing was heard.
+It exits 1, printing nothing on stdout, when you cancel or nothing was heard, and says why on stderr.
+
+The model stays loaded between searches in a background daemon, which the first search starts: that one waits several seconds for EmbeddingGemma 2 to load, and later ones start listening straight away. The daemon serves one search at a time over a socket in `~/.cache/code-chat/`, logs to `daemon.log` there, and exits after 30 minutes without a search. It restarts itself when code-chat's code changes, so an editable install never runs stale code. `code-chat stop` stops it sooner.
 
 ## Any editor
 
 `--list` prints matches in the `path:line:col: text` format grep and compilers use, which most editors can jump through: Vim's quickfix list, Emacs' `grep-mode` and `compilation-mode`, and the clickable paths in VS Code's terminal.
 
-For a live integration like the Neovim picker, run `code-chat serve [ROOT]` and talk to it in JSON, one message per line, over stdin and stdout:
+For a live integration like the Neovim picker, run `code-chat serve [ROOT]` and talk to it in JSON, one message per line, over stdin and stdout. Or connect to the daemon's socket, `~/.cache/code-chat/daemon.sock`, to share its loaded model: open with `{"type": "open", "root": "/abs/repo", "fingerprint": "..."}`, wait for `{"type": "opened"}` (a `{"type": "restarting"}` means the daemon is older than your code; connect again), then speak the same protocol. `src/code_chat/daemon.py` has the client side.
 
 | Direction | Message |
 | --- | --- |
@@ -71,8 +73,11 @@ Each hit has `file` (absolute), `path` (relative to the repository), `start`, `e
 
 ## Development
 
-The Python is held to [zanity](https://github.com/benomahony/zanity) with every rule on (`zanity.toml`), strict:
+The Python is held to [zanity](https://github.com/benomahony/zanity) with every rule on (`zanity.toml`), and to [basedpyright](https://docs.basedpyright.com) in strict mode, with no warnings:
 
 ```sh
 zanity check . --strict
+uv run basedpyright
 ```
+
+`.github/workflows/check.yml` runs both on every change and daily. `typings/` holds type stubs for sounddevice, which ships none. `zanity check . --strict --infer` also asks a language model to judge what structure can't, such as error messages that don't say what to do.

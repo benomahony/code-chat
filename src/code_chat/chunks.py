@@ -28,28 +28,26 @@ class Chunk:
     start: int  # First line, 1-based.
     end: int  # Last line, 1-based and inclusive.
     text: str
-    symbols: list[str] = field(default_factory=list)
+    symbols: list[str] = field(default_factory=list[str])
 
     def document(self) -> str:
-        assert 1 <= self.start <= self.end, f"chunk of {self.file} has lines {self.start}-{self.end}; they must count up from 1"
-        assert self.file and not self.file.startswith("/"), f"chunk path {self.file!r} must be relative to the repository"
+        assert 1 <= self.start <= self.end, f"chunk of {self.file} has lines {self.start}-{self.end}; split() must count lines up from 1"
+        assert self.file and not self.file.startswith("/"), f"chunk path {self.file!r} must be relative; make it relative to the repository root"
         # EmbeddingGemma's document format, with the path as the title.
-        out = plain(f"title: {self.file} | text: {self.text}")
-        assert "<|" not in out, f"special tokens left in the document for {self.file}; plain() must break them up"
-        return out
+        return plain(f"title: {self.file} | text: {self.text}")
 
 
 def plain(text: str) -> str:
     """Break up special tokens like <|audio|>, which code can contain and the
     model would otherwise read as a request for audio input."""
     out = text.replace("<|", "< |")
-    assert "<|" not in out, f"plain() left a special token in {out[:80]!r}"
-    assert len(out) >= len(text), f"plain() shortened {len(text)} characters to {len(out)}; it only inserts them"
+    assert "<|" not in out, f"plain() left a special token in {out[:80]!r}; replace every '<|' before embedding"
+    assert len(out) >= len(text), f"plain() shortened {len(text)} characters to {len(out)}; it should only insert spaces"
     return out
 
 
 def files(root: Path) -> list[str]:
-    assert root.is_absolute(), f"repository root {root} must be absolute, so chunk paths resolve the same everywhere"
+    assert root.is_absolute(), f"repository root {root} must be absolute; resolve() it so chunk paths match everywhere"
     assert root.is_dir(), f"repository root {root} isn't a directory; pass the repository to search"
     try:
         out = subprocess.run(
@@ -64,13 +62,13 @@ def files(root: Path) -> list[str]:
         names = [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and ".git" not in p.parts]
     kept = sorted(name for name in names if wanted(root, name))
     absolute = [name for name in kept if name.startswith("/")]
-    assert not absolute, f"file names must be relative to {root}, but got {absolute[:3]}"
+    assert not absolute, f"file names must be relative to {root}, but got {absolute[:3]}; list them from the repository root"
     return kept
 
 
 def wanted(root: Path, name: str) -> bool:
-    assert root.is_absolute(), f"repository root {root} must be absolute"
-    assert name and not name.startswith("/"), f"file name {name!r} must be relative to {root}"
+    assert root.is_absolute(), f"repository root {root} must be absolute; resolve() it first"
+    assert name and not name.startswith("/"), f"file name {name!r} must be relative; pass it relative to {root}"
     path = root / name
     if path.name in SKIP_NAMES or name.endswith(SKIP_SUFFIXES) or language(name) is None:
         return False
@@ -82,15 +80,15 @@ def wanted(root: Path, name: str) -> bool:
 
 
 def language(name: str) -> str | None:
-    assert name, "language() needs a file name to detect a language from"
+    assert name, "language() needs a file name; pass the file's path"
     detected = tslp.detect_language_from_path(name)
-    assert detected is None or detected.strip() == detected, f"language for {name} came back as {detected!r}"
+    assert detected is None or detected.strip() == detected, f"language for {name} came back as {detected!r}; upgrade tree-sitter-language-pack"
     return detected
 
 
 def split(root: Path, name: str) -> list[Chunk]:
-    assert root.is_absolute(), f"repository root {root} must be absolute"
-    assert language(name) is not None, f"{name} has no language tree-sitter knows; files() should have skipped it"
+    assert root.is_absolute(), f"repository root {root} must be absolute; resolve() it first"
+    assert language(name) is not None, f"{name} has no language tree-sitter knows; check wanted() before splitting it"
     try:
         source = (root / name).read_text()
     except (UnicodeDecodeError, OSError):
@@ -99,36 +97,40 @@ def split(root: Path, name: str) -> list[Chunk]:
     chunks = syntax_chunks(name, source) if source.strip() else []
     if source.strip() and not chunks:
         chunks = windows(name, source)
-    assert all(c.file == name for c in chunks), f"every chunk of {name} must name it as its file"
+    assert all(c.file == name for c in chunks), f"every chunk of {name} must name it as its file; pass name through to Chunk"
     return chunks
 
 
 def syntax_chunks(name: str, source: str) -> list[Chunk]:
     """Chunks cut along the syntax tree, or none if tree-sitter can't parse it."""
-    assert source.strip(), f"{name} is blank; there's nothing to split"
+    assert source.strip(), f"{name} is blank; only split files with code in them"
+    detected = language(name)
+    assert detected is not None, f"{name} has no language tree-sitter knows; check wanted() before splitting it"
     try:
-        result = tslp.process(source, tslp.ProcessConfig(language(name), chunk_max_size=MAX_CHUNK))
+        result = tslp.process(source, tslp.ProcessConfig(detected, chunk_max_size=MAX_CHUNK))
     except tslp.Error:
         return []
     chunks = [
         # tree-sitter lines are 0-based and inclusive.
-        Chunk(name, c.start_line + 1, c.end_line + 1, c.content, list(dict.fromkeys(c.metadata.symbols_defined)))
+        Chunk(name, c.start_line + 1, c.end_line + 1, c.content, list(dict.fromkeys(c.metadata.symbols_defined if c.metadata else [])))
         for c in result.chunks
         if c.content.strip()
     ]
-    assert all(c.start <= c.end for c in chunks), f"tree-sitter returned a chunk of {name} that ends before it starts"
+    backwards = [(c.start, c.end) for c in chunks if c.start > c.end]
+    assert not backwards, f"tree-sitter returned chunks of {name} that end before they start: {backwards[:3]}; upgrade tree-sitter-language-pack"
     return chunks
 
 
 def windows(name: str, source: str) -> list[Chunk]:
     """Fixed windows of lines, for files tree-sitter couldn't split."""
     lines = source.splitlines()
-    assert lines, f"{name} has no lines to window"
-    chunks = []
+    assert lines, f"{name} has no lines to window; only window files with code in them"
+    chunks: list[Chunk] = []
     for start in range(0, len(lines), WINDOW_LINES):
         stop = min(start + WINDOW_LINES, len(lines))
         text = "\n".join(lines[start:stop])
         if text.strip():
             chunks.append(Chunk(name, start + 1, stop, text))
-    assert all(c.end - c.start < WINDOW_LINES for c in chunks), f"a window of {name} is longer than {WINDOW_LINES} lines"
+    long = [(c.start, c.end) for c in chunks if c.end - c.start >= WINDOW_LINES]
+    assert not long, f"windows of {name} longer than {WINDOW_LINES} lines: {long[:3]}; step by WINDOW_LINES"
     return chunks

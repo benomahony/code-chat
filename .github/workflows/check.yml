@@ -1,0 +1,36 @@
+# Strict static analysis on every change, and daily so new rules and new
+# releases of what code-chat depends on can't drift in unnoticed. Any
+# warning fails the build.
+name: check
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  # A pinned zanity release, run only once its SHA-256 matches the one GitHub
+  # lists for it. Dependabot can't update this; bump both together.
+  ZANITY_VERSION: v0.1.9
+  ZANITY_SHA256: d5e77cdafd3fd39291a52e4951455b2f7b3883eaa6a47d1fbdbc5119754b3737
+
+jobs:
+  check:
+    # Apple silicon, matching the zanity build above and where code-chat runs.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Install code-chat and its dev tools
+        run: uv sync --group dev
+      - name: Install zanity, verified
+        run: |
+          curl -fsSLo zanity "https://github.com/benomahony/zanity/releases/download/$ZANITY_VERSION/zanity-macos-aarch64"
+          echo "$ZANITY_SHA256  zanity" | shasum -a 256 -c -
+          chmod +x zanity
+      - name: zanity, every rule, strict
+        run: ./zanity check . --strict
+      - name: basedpyright, strict
+        run: uv run basedpyright
