@@ -1,0 +1,23 @@
+[project]
+name = "code-chat"
+version = "0.1.0"
+description = "Search code by describing it, out loud, with EmbeddingGemma 2, from Neovim."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "sentence-transformers>=6",
+    "sounddevice",
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "librosa",
+    "tree-sitter-language-pack",
+]
+
+[project.scripts]
+code-chat = "code_chat.server:main"
+
+[build-system]
+requires = ["uv_build>=0.8,<0.12"]
+build-backend = "uv_build"
