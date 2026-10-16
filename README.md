@@ -10,20 +10,30 @@ Needs [uv](https://docs.astral.sh/uv/), a microphone and, for speed, Apple silic
 
 ## Neovim
 
-A [Snacks](https://github.com/folke/snacks.nvim) picker: the list re-ranks live as you talk, the preview shows the matched chunk highlighted, and the title shows the microphone's waveform.
+Needs Neovim 0.11+. While you speak, the best-matching chunks appear as a stack of live, syntax-highlighted code cards beside a waveform, and the window you came from follows the top match, with it highlighted.
 
 ```lua
-vim.pack.add({ "https://github.com/folke/snacks.nvim", "/Users/benomahony/Code/open_source/code-chat" })
-vim.keymap.set("n", "<leader>sv", "<cmd>CodeChat<cr>", { desc = "Search code by [V]oice" })
+vim.pack.add({ "/Users/benomahony/Code/open_source/code-chat" })
+vim.keymap.set("n", "<leader>sv", "<cmd>CodeChat<cr>", { desc = "[S]earch code by [V]oice" })
 ```
 
-`:CodeChat` opens the picker and starts listening. Listening stops after a 2.5 s pause, or after 8 s if you don't say anything. Then it's an ordinary Snacks picker: `<CR>` opens the match, `<C-q>` sends every match to the quickfix list, `<C-v>` / `<C-s>` open in a split, and typing filters the matches. `<C-Space>` speaks again.
+`:CodeChat` opens the cards and starts listening. Describe the code, e.g. "where we retry the download when YouTube refuses". Listening stops after a 2.5 s pause, or after 8 s if you don't say anything.
 
-`vim.pack` installs a local path by cloning it, so changes here reach Neovim once they're committed and you run `vim.pack.update()`. The first search sets up the Python environment, loads the model and embeds the repository; later runs only embed what changed. To load the model when Neovim starts instead:
+| Key | Does |
+| --- | --- |
+| `j` / `k` (or `<C-n>` / `<C-p>`, `<Tab>`) | Move between matches; the main window follows |
+| `1`–`9` | Pick a visible card |
+| `<CR>` | Go to the match, with every match in the quickfix list (`]q` / `[q` step through them) |
+| `<Space>` | Speak again |
+| `<Esc>` / `q` | Close and go back to where you were |
 
-```lua
-vim.api.nvim_create_autocmd("VimEnter", { callback = function() require("code-chat").start() end })
-```
+Matches stay highlighted after `<CR>` until `:CodeChatClear`. `<C-o>` returns to where you started.
+
+When Neovim opens in a git repository, or `:cd`s into one, code-chat loads the model and indexes it in the background, so the first search doesn't wait. Only what changed since last time is embedded.
+
+`vim.pack` installs a local path by cloning it, so changes here reach Neovim once they're committed and you run `vim.pack.update()`.
+
+`require("code-chat").setup({ cards = 4, width = 0.5, context = 3, index_on_open = true })` changes how many cards show at once, the share of the screen they take, how many lines show above a match in the main window, and whether to index on opening a project.
 
 ## Terminal
 
@@ -64,7 +74,7 @@ For a live integration like the Neovim picker, run `code-chat serve [ROOT]` and 
 | Out | `{"type": "listening", "on": true}` and, about 20 times a second, `{"type": "level", "value": 0.7}` |
 | Out | `{"type": "results", "final": false, "seconds": 2.2, "hits": [...]}` on each re-rank; `final` once listening ends |
 
-Each hit has `file` (absolute), `path` (relative to the repository), `start`, `end` and `end_col` (1-based lines, inclusive), `symbols`, a one-line `preview` and its `score`. `lua/code-chat/init.lua` is a complete client in under 250 lines.
+Each hit has `file` (absolute), `path` (relative to the repository), `start`, `end` and `end_col` (1-based lines, inclusive), `symbols`, a one-line `preview` and its `score`. `lua/code-chat/init.lua` is a complete client.
 
 ## How it works
 
