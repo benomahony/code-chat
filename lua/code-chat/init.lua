@@ -1,6 +1,7 @@
 -- Search code by describing it out loud. The Python daemon
--- (src/code_chat/server.py) embeds the repository with EmbeddingGemma 2 and
--- re-ranks its chunks against your voice while you talk. Here, the best
+-- (src/code_chat/server.py, kept warm by daemon.py and shared with the
+-- terminal) embeds the repository with EmbeddingGemma 2 and re-ranks its
+-- chunks against your voice while you talk. Here, the best
 -- chunks show live as a stack of code cards beside a waveform, and the window
 -- you came from follows the top match with it highlighted.
 
@@ -118,8 +119,13 @@ local function start()
   server.root, server.ready, server.status = dir, false, "Starting…"
   local partial = ""
   local errors = {}
-  server.job = vim.fn.jobstart({ "uv", "run", "--quiet", "--directory", plugin_root, "code-chat", "serve", dir }, {
-    on_stdout = function(_, data)
+  -- Through the shared daemon, which serves one connection at a time: this
+  -- one hangs up once the index is ready, unless a search is open.
+  server.job = vim.fn.jobstart({ "uv", "run", "--quiet", "--directory", plugin_root, "code-chat", "connect", dir }, {
+    on_stdout = function(job, data)
+      if server.job ~= job then
+        return
+      end
       data[1] = partial .. data[1]
       partial = table.remove(data)
       for _, line in ipairs(data) do
@@ -142,6 +148,17 @@ local function start()
       end
     end,
   })
+end
+
+-- Hang up, freeing the daemon for the terminal or another Neovim; the next
+-- search connects again.
+local function hang_up()
+  local job = server.job
+  server.job, server.ready = nil, false
+  state.listening, state.level = false, 0
+  if job then
+    vim.fn.chanclose(job, "stdin")
+  end
 end
 
 local function send(message)
@@ -324,9 +341,8 @@ local function close()
   ui = nil
   closing.timer:stop()
   closing.timer:close()
-  if state.listening then
-    send({ type = "stop" })
-  end
+  -- Hanging up also stops listening.
+  hang_up()
   for _, win in ipairs(vim.list_extend({ closing.header_win }, vim.tbl_map(function(c)
     return c.win
   end, closing.cards))) do
@@ -509,6 +525,10 @@ handle = function(message)
   elseif kind == "ready" then
     server.ready = true
     server.status = ("%d chunks indexed"):format(message.chunks)
+    -- Indexed ahead of a search: let others use the daemon until then.
+    if not ui then
+      hang_up()
+    end
   elseif kind == "listening" then
     state.listening = message.on
     if message.on then

@@ -29,7 +29,7 @@ vim.keymap.set("n", "<leader>sv", "<cmd>CodeChat<cr>", { desc = "[S]earch code b
 
 Matches stay highlighted after `<CR>` until `:CodeChatClear`. `<C-o>` returns to where you started.
 
-When Neovim opens in a git repository, or `:cd`s into one, code-chat loads the model and indexes it in the background, so the first search doesn't wait. Only what changed since last time is embedded.
+When Neovim opens in a git repository, or `:cd`s into one, code-chat indexes it in the background, so the first search doesn't wait. Only what changed since last time is embedded. Neovim shares the terminal's background daemon (see below), so once one of them has loaded the model, a new Neovim is ready in well under a second.
 
 `vim.pack` installs a local path by cloning it, so changes here reach Neovim once they're committed and you run `vim.pack.update()`.
 
@@ -65,7 +65,7 @@ The model stays loaded between searches in a background daemon, which the first 
 
 `--list` prints matches in the `path:line:col: text` format grep and compilers use, which most editors can jump through: Vim's quickfix list, Emacs' `grep-mode` and `compilation-mode`, and the clickable paths in VS Code's terminal.
 
-For a live integration like the Neovim picker, run `code-chat serve [ROOT]` and talk to it in JSON, one message per line, over stdin and stdout. Or connect to the daemon's socket, `~/.cache/code-chat/daemon.sock`, to share its loaded model: open with `{"type": "open", "root": "/abs/repo", "fingerprint": "..."}`, wait for `{"type": "opened"}` (a `{"type": "restarting"}` means the daemon is older than your code; connect again), then speak the same protocol. `src/code_chat/daemon.py` has the client side.
+For a live integration like the Neovim plugin, run `code-chat serve [ROOT]` and talk to it in JSON, one message per line, over stdin and stdout. `code-chat connect [ROOT]` speaks the same over stdin and stdout but through the shared daemon, which is what Neovim uses; hang up (close stdin) when the search ends, as the daemon serves one connection at a time. Or connect to the daemon's socket, `~/.cache/code-chat/daemon.sock`, to share its loaded model: open with `{"type": "open", "root": "/abs/repo", "fingerprint": "..."}`, wait for `{"type": "opened"}` (a `{"type": "restarting"}` means the daemon is older than your code; connect again), then speak the same protocol. `src/code_chat/daemon.py` has the client side.
 
 | Direction | Message |
 | --- | --- |

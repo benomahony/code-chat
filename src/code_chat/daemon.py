@@ -48,13 +48,14 @@ WAIT = 0.1
 
 
 def fingerprint() -> str:
-    """Changes whenever code-chat's own code does."""
+    """Changes whenever code-chat's own code does. By content, so copies of
+    the same code, such as Neovim's plugin and an editable install, share a
+    daemon instead of restarting each other's."""
     sources = sorted(Path(__file__).parent.glob("*.py"))
     assert sources, f"found no code in {Path(__file__).parent}; reinstall code-chat"
     digest = hashlib.sha256()
     for source in sources:
-        stat = source.stat()
-        digest.update(f"{source.name}:{stat.st_mtime_ns}:{stat.st_size};".encode())
+        digest.update(f"{source.name}:".encode() + source.read_bytes() + b";")
     out = digest.hexdigest()[:16]
     assert len(out) == 16, f"fingerprint {out!r} should be 16 hex digits; keep the [:16] slice"
     return out
@@ -135,9 +136,16 @@ def serve_connection(connection: socket.socket):
     assert connection.family == socket.AF_UNIX, f"connections come over a Unix socket, got family {connection.family}; connect to {SOCKET}"
     assert SOCKET.exists(), f"serving a connection though {SOCKET} is gone; only listen_until_idle() should accept them"
     connection.settimeout(None)
-    reader = connection.makefile("r", encoding="utf-8")
-    writer = connection.makefile("w", encoding="utf-8")
-    line = reader.readline()
+    # The socket only really closes once these do too, and the client waits
+    # for that to know the search is over.
+    with connection.makefile("r", encoding="utf-8") as reader, connection.makefile("w", encoding="utf-8") as writer:
+        answer(line=reader.readline(), reader=reader, writer=writer)
+
+
+def answer(line: str, reader: TextIO, writer: TextIO):
+    """Act on a connection's opening line."""
+    assert reader.readable() and writer.writable(), f"answer() needs the connection's read and write sides, got {reader} and {writer}"
+    assert "\n" not in line.rstrip("\n"), f"answer() takes the opening line alone, got {line[:80]!r}; pass one readline()"
     # A client that hangs up without a word.
     if not line:
         return

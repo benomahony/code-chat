@@ -7,6 +7,7 @@
     code-chat --open [ROOT]    ... always open it, in vi if no editor is set
     code-chat --list [ROOT]    listen, then print every match as path:line:col: text
     code-chat serve [ROOT]     the JSON-lines engine, over stdin and stdout, for an editor
+    code-chat connect [ROOT]   the same, through the daemon, sharing its loaded model
     code-chat daemon           the same engine over a socket, keeping the model loaded
     code-chat stop             stop the daemon
 
@@ -60,7 +61,7 @@ UP = ("k", "\x1b[A", "\x10", "\x1b[Z")
 # Editors that take file:line as one argument; the rest take +line file.
 COLON_EDITORS = ("zed", "subl", "hx", "helix", "micro")
 GOTO_EDITORS = ("code", "code-insiders", "cursor", "windsurf", "codium")
-COMMANDS = ("serve", "daemon", "stop")
+COMMANDS = ("serve", "connect", "daemon", "stop")
 DESCRIPTION = "Search code by describing it out loud, from any terminal or editor."
 
 
@@ -112,15 +113,49 @@ def chosen_editor(out: TextIO, opening: bool, printing: bool) -> str | None:
 
 
 def run_command(command: str, rest: list[str]):
-    """code-chat serve, daemon or stop."""
+    """code-chat serve, connect, daemon or stop."""
     assert command in COMMANDS, f"{command!r} isn't a command; use one of {COMMANDS}"
     assert len(rest) <= 1, f"{command} takes at most a repository, got {rest}; pass one path"
     if command == "serve":
         server.main(Path(rest[0] if rest else ".").resolve())
+    elif command == "connect":
+        bridge(Path(rest[0] if rest else ".").resolve())
     elif command == "daemon":
         daemon.serve_forever()
     else:
         print("stopped" if daemon.stop() else "no daemon was running", file=sys.stderr)
+
+
+def bridge(root: Path):
+    """Relay the protocol between stdin and stdout and the daemon, so an
+    editor can talk to the daemon as it would to `code-chat serve`. Closing
+    stdin hangs up, which frees the daemon for the next search."""
+    assert root.is_dir(), f"{root} isn't a directory; pass the repository to search"
+    out = server.protect_stdout()
+    connection, messages = daemon.connect(root)
+    with connection:
+        threading.Thread(target=forward, args=(sys.stdin, connection), daemon=True).start()
+        try:
+            for line in messages:
+                out.write(line)
+                out.flush()
+        except BrokenPipeError:
+            # The editor went away; hanging up below ends the search.
+            return
+    assert connection.fileno() == -1, "the daemon connection should be closed by now; keep the relay inside the with block"
+
+
+def forward(lines: TextIO, connection: socket.socket):
+    """Send the editor's commands on to the daemon, then hang up our side."""
+    assert connection.family == socket.AF_UNIX, f"forwarding to a {connection.family} socket; connect to the daemon's Unix socket"
+    assert lines.readable(), f"can't read commands from {lines}; pass stdin"
+    try:
+        for line in lines:
+            connection.sendall(line.encode())
+        connection.shutdown(socket.SHUT_WR)
+    except OSError:
+        # The daemon hung up first; the relay ends with it.
+        return
 
 
 def result_stream() -> TextIO:
