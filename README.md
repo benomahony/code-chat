@@ -41,14 +41,17 @@ When Neovim opens in a git repository, or `:cd`s into one, code-chat loads the m
 uv tool install --editable /Users/benomahony/Code/open_source/code-chat
 ```
 
-`code-chat` listens in the repository you're in, showing the matches live as syntax-highlighted cards beside a waveform. When you stop talking, `↑`/`↓` (or `j`/`k`) choose one, `<Enter>` prints it as `path:line`, `<Space>` speaks again and `<Esc>` quits.
+`code-chat` listens in the repository you're in, showing the matches live as syntax-highlighted cards beside a waveform. When you stop talking, `↑`/`↓` (or `j`/`k`) choose one, `<Enter>` opens it, `<Space>` speaks again and `<Esc>` quits.
+
+`<Enter>` opens the match at its line in `$VISUAL` or `$EDITOR`, e.g. `nvim +12 file` or `code --goto file:12` (Cursor, Windsurf, Zed, Sublime, Helix and others get their own syntax). With neither set, or when stdout is captured as in `$(code-chat)`, it prints `path:line` instead.
 
 The live view draws on stderr, so stdout carries only the result:
 
 ```sh
 nvim $(code-chat)              # or vim, hx, zed: open the match you chose
 code -g $(code-chat)           # VS Code, Cursor and the like
-code-chat --open               # open it in $VISUAL / $EDITOR at the right line
+code-chat --print              # print path:line even with an editor set
+code-chat --open               # open it even when stdout isn't a terminal (vi if no editor)
 code-chat --list               # every match, as path:line:col: text
 vim -q <(code-chat --list)     # ...into Vim's quickfix list
 code-chat ~/Code/some/repo     # search another repository

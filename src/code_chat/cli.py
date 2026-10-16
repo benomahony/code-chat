@@ -1,7 +1,10 @@
 """Search code by describing it out loud, from any terminal or editor.
 
-    code-chat [ROOT]           listen, show matches live, print the chosen path:line
-    code-chat --open [ROOT]    ... and open it in $VISUAL / $EDITOR at that line
+    code-chat [ROOT]           listen, show matches live, open the chosen one in
+                               $VISUAL / $EDITOR at its line, or print path:line
+                               when neither is set or stdout isn't a terminal
+    code-chat --print [ROOT]   ... always print path:line
+    code-chat --open [ROOT]    ... always open it, in vi if no editor is set
     code-chat --list [ROOT]    listen, then print every match as path:line:col: text
     code-chat serve [ROOT]     the JSON-lines engine, over stdin and stdout, for an editor
     code-chat daemon           the same engine over a socket, keeping the model loaded
@@ -69,7 +72,8 @@ def main():
     parser = argparse.ArgumentParser(prog="code-chat", description=DESCRIPTION)
     parser.add_argument("root", nargs="?", help="repository to search (default: the git repo you're in)")
     output = parser.add_mutually_exclusive_group()
-    output.add_argument("--open", action="store_true", help="open the chosen match in $VISUAL / $EDITOR")
+    output.add_argument("--open", action="store_true", help="open the chosen match in $VISUAL / $EDITOR, even when stdout isn't a terminal")
+    output.add_argument("--print", action="store_true", help="print the chosen match as path:line, even when an editor is set")
     output.add_argument("--list", action="store_true", help="print every match, grep style, without choosing")
     args = parser.parse_args()
     out = result_stream()
@@ -85,12 +89,26 @@ def main():
         sys.exit(1)
     if args.list:
         print("\n".join(grep_line(hit) for hit in hits), file=out)
-    elif args.open:
+    elif editor := chosen_editor(out, opening=cast(bool, args.open), printing=cast(bool, args.print)):
         out.close()
-        command = editor_command(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi", hits[0]["file"], hits[0]["start"])
+        command = editor_command(editor, hits[0]["file"], hits[0]["start"])
         os.execvp(command[0], command)
     else:
         print(f"{shown(hits[0]['file'])}:{hits[0]['start']}", file=out)
+
+
+def chosen_editor(out: TextIO, opening: bool, printing: bool) -> str | None:
+    """The editor to open the match in, or None to print it. An editor set in
+    $VISUAL or $EDITOR opens it, unless stdout is captured, as in
+    `nvim $(code-chat)`, which wants the path."""
+    assert not (opening and printing), f"got --open={opening} and --print={printing}; pass at most one, as argparse enforces"
+    assert not out.closed, "chosen_editor() checks whether the result stream is a terminal; call it before closing that"
+    editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR") or "").strip()
+    if opening:
+        return editor or "vi"
+    if printing or not editor or not out.isatty():
+        return None
+    return editor
 
 
 def run_command(command: str, rest: list[str]):
