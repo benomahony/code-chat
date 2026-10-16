@@ -29,9 +29,9 @@ UPDATE_EVERY = int(0.75 * RATE)
 # they never start.
 VOICE_RMS = 0.004
 NOISE_RATIO = 3
-PAUSE = 2.5
+PAUSE = 4.0
 MIN_TALK = 2.0
-SILENT_TIMEOUT = 8.0
+SILENT_TIMEOUT = 12.0
 # Microphone errors, such as no input device or no permission to use it.
 MicrophoneError = sd.PortAudioError
 

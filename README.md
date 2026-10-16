@@ -17,7 +17,7 @@ vim.pack.add({ "/Users/benomahony/Code/open_source/code-chat" })
 vim.keymap.set("n", "<leader>sv", "<cmd>CodeChat<cr>", { desc = "[S]earch code by [V]oice" })
 ```
 
-`:CodeChat` opens the cards and starts listening. Describe the code, e.g. "where we retry the download when YouTube refuses". Listening stops after a 2.5 s pause, or after 8 s if you don't say anything.
+`:CodeChat` opens the cards and starts listening. Describe the code, e.g. "where we retry the download when YouTube refuses". Listening stops after a 4 s pause, or after 12 s if you don't say anything.
 
 | Key | Does |
 | --- | --- |
